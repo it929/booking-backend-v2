@@ -214,6 +214,37 @@ class BookingController extends Controller
                 ]);
             }
 
+            // 4b. Enforce Clinic-Level Duplicate Booking Prevention
+            // Patients cannot book for the same clinical specialty twice on the same date.
+            $phoneDigits = preg_replace('/\D/', '', $cleanPhone);
+            $last10 = strlen($phoneDigits) >= 10 ? substr($phoneDigits, -10) : $phoneDigits;
+
+            $duplicateBooking = Booking::with(['department'])
+                ->where('department_id', $doctor->department_id)
+                ->whereDate('appointment_date', $appDate)
+                ->where('is_active', true)
+                ->whereNotIn('status', ['Cancelled', 'Rejected', 'Deleted'])
+                ->where(function ($q) use ($cleanPhone, $last10, $patient) {
+                    $q->where('patient_phone', $cleanPhone)
+                      ->orWhere('patient_phone', 'like', "%{$last10}");
+                    if ($patient) {
+                        $q->orWhere('patient_id', $patient->id);
+                    }
+                })
+                ->first();
+
+            if ($duplicateBooking) {
+                $clinicName = $duplicateBooking->department?->name ?? ($doctor->department?->name ?? 'this Specialty');
+                $formattedDate = Carbon::parse($appDate)->format('D, d M Y');
+                return response()->json([
+                    'error' => 'Duplicate clinic booking detected',
+                    'detail' => "You already have an active appointment scheduled for the {$clinicName} Clinic on {$formattedDate} (Ticket Ref: {$duplicateBooking->reference_code}). To prevent duplicate intake queues, patients cannot book the same clinic twice on the same date.",
+                    'existing_reference' => $duplicateBooking->reference_code,
+                    'existing_booking_id' => $duplicateBooking->id,
+                    'status' => 409,
+                ], 409);
+            }
+
             // 5. Resolve HMO Company if applicable
             $hmoId = null;
             $rawPaymentType = $validated['payment_type'] ?? 'Private Self-Pay';
@@ -739,6 +770,42 @@ class BookingController extends Controller
                 return response()->json([
                     'error' => 'Clinic capacity reached',
                     'detail' => "Doctor {$doctor->initial_name} is fully booked on {$newDateStr} ({$existingBookingsCount}/{$capacity} slots reserved). Please select another date.",
+                    'status' => 409,
+                ], 409);
+            }
+            // Check for duplicate clinic booking on target reschedule date
+            $targetDeptId = $doctor->department_id ?: $booking->department_id;
+            $cleanPhone = $booking->patient_phone ? preg_replace('/[^\d+]/', '', $booking->patient_phone) : null;
+            $phoneDigits = $cleanPhone ? preg_replace('/\D/', '', $cleanPhone) : '';
+            $last10 = strlen($phoneDigits) >= 10 ? substr($phoneDigits, -10) : $phoneDigits;
+
+            $duplicateReschedule = Booking::with(['department'])
+                ->where('department_id', $targetDeptId)
+                ->whereDate('appointment_date', $newDateStr)
+                ->where('id', '!=', $booking->id)
+                ->where('is_active', true)
+                ->whereNotIn('status', ['Cancelled', 'Rejected', 'Deleted'])
+                ->where(function ($q) use ($cleanPhone, $last10, $booking) {
+                    if ($cleanPhone) {
+                        $q->where('patient_phone', $cleanPhone);
+                        if (!empty($last10)) {
+                            $q->orWhere('patient_phone', 'like', "%{$last10}");
+                        }
+                    }
+                    if ($booking->patient_id) {
+                        $q->orWhere('patient_id', $booking->patient_id);
+                    }
+                })
+                ->first();
+
+            if ($duplicateReschedule) {
+                $clinicName = $duplicateReschedule->department?->name ?? ($doctor->department?->name ?? 'this Specialty');
+                $formattedDate = Carbon::parse($newDateStr)->format('D, d M Y');
+                return response()->json([
+                    'error' => 'Duplicate clinic booking detected',
+                    'detail' => "You already have an active appointment scheduled for the {$clinicName} Clinic on {$formattedDate} (Ticket Ref: {$duplicateReschedule->reference_code}). Patients cannot hold duplicate appointments for the same specialty on the same date.",
+                    'existing_reference' => $duplicateReschedule->reference_code,
+                    'existing_booking_id' => $duplicateReschedule->id,
                     'status' => 409,
                 ], 409);
             }
