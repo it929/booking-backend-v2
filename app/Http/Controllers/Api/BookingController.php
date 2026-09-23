@@ -195,12 +195,9 @@ class BookingController extends Controller
 
             // 4. Resolve or Create Patient Record
             $cleanPhone = preg_replace('/[^0-9+]/', '', $validated['patient_phone']);
+            $patientNameClean = trim($validated['patient_name']);
             $patient = Patient::where('phone', $cleanPhone)
-                ->orWhere(function ($q) use ($validated) {
-                    if (!empty($validated['patient_email'])) {
-                        $q->where('email', strtolower(trim($validated['patient_email'])));
-                    }
-                })
+                ->whereRaw('LOWER(TRIM(name)) = ?', [strtolower($patientNameClean)])
                 ->first();
 
             if (!$patient) {
@@ -208,29 +205,28 @@ class BookingController extends Controller
                 $mrn = 'ISL-PAT-' . str_pad($mrnSeq, 5, '0', STR_PAD_LEFT);
                 $patient = Patient::create([
                     'mrn' => $mrn,
-                    'name' => $validated['patient_name'],
+                    'name' => $patientNameClean,
                     'phone' => $cleanPhone,
                     'email' => !empty($validated['patient_email']) ? strtolower(trim($validated['patient_email'])) : null,
                 ]);
             }
 
             // 4b. Enforce Clinic-Level Duplicate Booking Prevention
-            // Patients cannot book for the same clinical specialty twice on the same date.
+            // The same patient (matched by phone number AND patient name) cannot book the same clinic twice on the same appointment date.
             $phoneDigits = preg_replace('/\D/', '', $cleanPhone);
             $last10 = strlen($phoneDigits) >= 10 ? substr($phoneDigits, -10) : $phoneDigits;
+            $normalizedName = strtolower(preg_replace('/\s+/', ' ', $patientNameClean));
 
             $duplicateBooking = Booking::with(['department'])
                 ->where('department_id', $doctor->department_id)
                 ->whereDate('appointment_date', $appDate)
                 ->where('is_active', true)
                 ->whereNotIn('status', ['Cancelled', 'Rejected', 'Deleted'])
-                ->where(function ($q) use ($cleanPhone, $last10, $patient) {
+                ->where(function ($q) use ($cleanPhone, $last10) {
                     $q->where('patient_phone', $cleanPhone)
                       ->orWhere('patient_phone', 'like', "%{$last10}");
-                    if ($patient) {
-                        $q->orWhere('patient_id', $patient->id);
-                    }
                 })
+                ->whereRaw('LOWER(TRIM(patient_name)) = ?', [$normalizedName])
                 ->first();
 
             if ($duplicateBooking) {
@@ -238,7 +234,7 @@ class BookingController extends Controller
                 $formattedDate = Carbon::parse($appDate)->format('D, d M Y');
                 return response()->json([
                     'error' => 'Duplicate clinic booking detected',
-                    'detail' => "You already have an active appointment scheduled for the {$clinicName} Clinic on {$formattedDate} (Ticket Ref: {$duplicateBooking->reference_code}). To prevent duplicate intake queues, patients cannot book the same clinic twice on the same date.",
+                    'detail' => "{$patientNameClean} already has an active appointment scheduled for the {$clinicName} Clinic on {$formattedDate} (Ticket Ref: {$duplicateBooking->reference_code}). To prevent duplicate intake queues, the same patient cannot book the same clinic twice on the same date.",
                     'existing_reference' => $duplicateBooking->reference_code,
                     'existing_booking_id' => $duplicateBooking->id,
                     'status' => 409,
@@ -778,6 +774,7 @@ class BookingController extends Controller
             $cleanPhone = $booking->patient_phone ? preg_replace('/[^\d+]/', '', $booking->patient_phone) : null;
             $phoneDigits = $cleanPhone ? preg_replace('/\D/', '', $cleanPhone) : '';
             $last10 = strlen($phoneDigits) >= 10 ? substr($phoneDigits, -10) : $phoneDigits;
+            $bookingNameClean = strtolower(preg_replace('/\s+/', ' ', trim($booking->patient_name ?? '')));
 
             $duplicateReschedule = Booking::with(['department'])
                 ->where('department_id', $targetDeptId)
@@ -785,17 +782,15 @@ class BookingController extends Controller
                 ->where('id', '!=', $booking->id)
                 ->where('is_active', true)
                 ->whereNotIn('status', ['Cancelled', 'Rejected', 'Deleted'])
-                ->where(function ($q) use ($cleanPhone, $last10, $booking) {
+                ->where(function ($q) use ($cleanPhone, $last10) {
                     if ($cleanPhone) {
                         $q->where('patient_phone', $cleanPhone);
                         if (!empty($last10)) {
                             $q->orWhere('patient_phone', 'like', "%{$last10}");
                         }
                     }
-                    if ($booking->patient_id) {
-                        $q->orWhere('patient_id', $booking->patient_id);
-                    }
                 })
+                ->whereRaw('LOWER(TRIM(patient_name)) = ?', [$bookingNameClean])
                 ->first();
 
             if ($duplicateReschedule) {
@@ -803,7 +798,7 @@ class BookingController extends Controller
                 $formattedDate = Carbon::parse($newDateStr)->format('D, d M Y');
                 return response()->json([
                     'error' => 'Duplicate clinic booking detected',
-                    'detail' => "You already have an active appointment scheduled for the {$clinicName} Clinic on {$formattedDate} (Ticket Ref: {$duplicateReschedule->reference_code}). Patients cannot hold duplicate appointments for the same specialty on the same date.",
+                    'detail' => "{$booking->patient_name} already has an active appointment scheduled for the {$clinicName} Clinic on {$formattedDate} (Ticket Ref: {$duplicateReschedule->reference_code}). The same patient cannot hold duplicate appointments for the same specialty on the same date.",
                     'existing_reference' => $duplicateReschedule->reference_code,
                     'existing_booking_id' => $duplicateReschedule->id,
                     'status' => 409,

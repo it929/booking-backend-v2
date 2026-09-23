@@ -116,8 +116,10 @@ class BookingApiTest extends TestCase
         $doctor = \App\Models\Doctor::with('department')->first();
         $this->assertNotNull($doctor);
 
-        $testDate = '2026-09-21'; // Monday
-        $dayOfWeek = 'Mon';
+        // Pick a future date (next week)
+        $futureDate = \Illuminate\Support\Carbon::now()->addDays(14);
+        $testDate = $futureDate->format('Y-m-d');
+        $dayOfWeek = $futureDate->format('D');
 
         \App\Models\DoctorSchedule::updateOrCreate(
             ['doctor_id' => $doctor->id, 'day_of_week' => $dayOfWeek],
@@ -138,7 +140,7 @@ class BookingApiTest extends TestCase
             ->whereDate('appointment_date', $testDate)
             ->delete();
 
-        // 1. Initial Booking for Clinic on Monday 21/09/2026
+        // 1. Initial Booking for Clinic on appointment date for "Duplicate Test Patient"
         $res1 = $this->postJson('/api/bookings', [
             'doctor_id' => $doctor->code ?: $doctor->id,
             'date' => $testDate,
@@ -152,15 +154,14 @@ class BookingApiTest extends TestCase
 
         $res1->assertStatus(201);
         $firstRef = $res1->json('reference_code');
-        $firstBookingId = $res1->json('id');
         $this->assertNotEmpty($firstRef);
 
-        // 2. Second Booking on same day for same clinic with normalized phone (+234 809 988 7766)
+        // 2. Second Booking on same date for same clinic with same phone AND SAME name -> BLOCKED (409)
         $res2 = $this->postJson('/api/bookings', [
             'doctor_id' => $doctor->code ?: $doctor->id,
             'date' => $testDate,
             'time' => '11:00 AM – 01:00 PM',
-            'patient_name' => 'Duplicate Test Patient',
+            'patient_name' => 'duplicate test patient', // case-insensitive variance
             'patient_phone' => '+234 809 988 7766', // format variance
             'patient_email' => 'duplicate_test@example.com',
             'reason' => 'Second consultation attempt',
@@ -171,7 +172,21 @@ class BookingApiTest extends TestCase
              ->assertJsonPath('error', 'Duplicate clinic booking detected')
              ->assertJsonPath('existing_reference', $firstRef);
 
-        // 3. Different clinic on same date should be allowed
+        // 3. Third Booking on same date for same clinic with SAME phone but DIFFERENT name (e.g. child / family member) -> ALLOWED (201)
+        $resFamily = $this->postJson('/api/bookings', [
+            'doctor_id' => $doctor->code ?: $doctor->id,
+            'date' => $testDate,
+            'time' => '02:00 PM – 04:00 PM',
+            'patient_name' => 'Junior Child Patient',
+            'patient_phone' => $phone,
+            'patient_email' => 'duplicate_test@example.com',
+            'reason' => 'Child consultation using parent phone',
+            'payment_type' => 'Private Self-Pay',
+        ]);
+
+        $resFamily->assertStatus(201);
+
+        // 4. Different clinic on same date with same patient name should be allowed
         $doctor2 = \App\Models\Doctor::where('department_id', '!=', $doctor->department_id)->first();
         if ($doctor2) {
             \App\Models\DoctorSchedule::updateOrCreate(
