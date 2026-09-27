@@ -44,6 +44,7 @@ Route::patch('bookings/{id}/approve-hmo', [BookingController::class, 'approveHmo
 Route::patch('bookings/{id}/pay-cashdesk', [BookingController::class, 'payCashdesk']);
 Route::patch('bookings/{id}/reroute-to-cashdesk', [BookingController::class, 'rerouteToCashdesk']);
 Route::patch('bookings/{id}/reschedule', [BookingController::class, 'reschedule']);
+Route::post('bookings/bulk-reschedule-doctor-session', [BookingController::class, 'bulkRescheduleDoctorSession']);
 Route::post('bookings/{id}/restore', [BookingController::class, 'restore']);
 
 // RESTful Resources

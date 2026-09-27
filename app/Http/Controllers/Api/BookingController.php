@@ -850,6 +850,94 @@ class BookingController extends Controller
         });
     }
 
+    public function bulkRescheduleDoctorSession(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'doctor_id' => 'required',
+            'source_date' => 'required|date_format:Y-m-d',
+            'target_date' => 'required|date_format:Y-m-d|different:source_date',
+            'reason' => 'required|string|max:500',
+            'booking_ids' => 'nullable|array',
+            'booking_ids.*' => 'integer',
+            'keep_same_time' => 'nullable|boolean',
+            'new_time' => 'nullable|string',
+        ]);
+
+        $doctor = Doctor::with(['department', 'schedules'])
+            ->where('id', $validated['doctor_id'])
+            ->orWhere('code', $validated['doctor_id'])
+            ->firstOrFail();
+
+        $sourceDate = $validated['source_date'];
+        $targetDate = $validated['target_date'];
+        $reason = trim($validated['reason']);
+        $keepSameTime = $request->boolean('keep_same_time', true);
+        $newTime = $request->input('new_time');
+
+        // Query active bookings for this doctor on source_date
+        $query = Booking::with(['patient', 'department', 'hmoCompany'])
+            ->where('doctor_id', $doctor->id)
+            ->whereDate('appointment_date', $sourceDate)
+            ->where('is_active', true)
+            ->whereNotIn('status', ['Completed', 'Cancelled', 'Rejected']);
+
+        if (!empty($validated['booking_ids'])) {
+            $query->whereIn('id', $validated['booking_ids']);
+        }
+
+        $bookings = $query->get();
+
+        if ($bookings->isEmpty()) {
+            return response()->json([
+                'error' => 'No active bookings found',
+                'detail' => "No scheduled, active patient consultations found for Dr. {$doctor->name} on {$sourceDate}.",
+                'status' => 404,
+            ], 404);
+        }
+
+        return DB::transaction(function () use ($bookings, $doctor, $sourceDate, $targetDate, $reason, $keepSameTime, $newTime, $request) {
+            $updatedList = [];
+            $userId = $request->user() ? $request->user()->id : null;
+
+            foreach ($bookings as $b) {
+                $oldTime = $b->appointment_time ?: $b->time;
+                $finalTime = $keepSameTime ? $oldTime : ($newTime ?: $oldTime);
+
+                $b->update([
+                    'appointment_date' => $targetDate,
+                    'appointment_time' => $finalTime,
+                    'reschedule_count' => ($b->reschedule_count ?? 0) + 1,
+                    'last_rescheduled_at' => now(),
+                    'reschedule_reason' => "Doctor clinic postponement: {$reason}",
+                ]);
+
+                BookingStatusLog::create([
+                    'booking_id' => $b->id,
+                    'user_id' => $userId,
+                    'from_status' => (string) $b->status,
+                    'to_status' => (string) $b->status,
+                    'note' => "Clinic session shifted by specialist Dr. {$doctor->name} from {$sourceDate} ({$oldTime}) to {$targetDate} ({$finalTime}). Reason: {$reason}",
+                ]);
+
+                $updatedList[] = $b->fresh(['doctor.department', 'patient', 'hmoCompany']);
+            }
+
+            return response()->json([
+                'message' => "Successfully shifted " . count($updatedList) . " patient appointment(s) to {$targetDate}.",
+                'updated_count' => count($updatedList),
+                'source_date' => $sourceDate,
+                'target_date' => $targetDate,
+                'doctor' => [
+                    'id' => $doctor->id,
+                    'name' => $doctor->name,
+                    'full_name' => $doctor->full_name,
+                    'specialty' => $doctor->specialty,
+                ],
+                'updated_bookings' => $updatedList,
+            ]);
+        });
+    }
+
     public function disabled(): JsonResponse
     {
         $bookings = Booking::with(['doctor', 'patient'])
