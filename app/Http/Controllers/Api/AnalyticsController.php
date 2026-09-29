@@ -26,7 +26,7 @@ class AnalyticsController extends Controller
         $todayRevenue = Payment::where('payment_status', 'Paid')->whereDate('paid_at', $today)->sum('amount');
 
         // Department breakdown
-        $departments = Department::withCount(['bookings' => function ($q) {
+        $departments = Department::select('id', 'name')->withCount(['bookings' => function ($q) {
             $q->where('is_active', true);
         }])->get()->map(function ($d) {
             return [

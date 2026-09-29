@@ -160,16 +160,24 @@ class Doctor extends Model
         return $this->image_url ?? '';
     }
 
+    public function getCachedSchedules()
+    {
+        if (!$this->relationLoaded('schedules')) {
+            $this->setRelation('schedules', $this->schedules()->get());
+        }
+        return $this->schedules;
+    }
+
     public function getActiveScheduleAttribute()
     {
-        $scheds = $this->relationLoaded('schedules') ? $this->schedules : $this->schedules()->get();
+        $scheds = $this->getCachedSchedules();
         return $scheds->where('status', true)->first() ?: $scheds->first();
     }
 
     public function getAvailableDaysAttribute(): array
     {
         try {
-            $scheds = $this->relationLoaded('schedules') ? $this->schedules : $this->schedules()->get();
+            $scheds = $this->getCachedSchedules();
             $activeScheds = $scheds->where('status', true);
             
             $days = [];
@@ -193,7 +201,7 @@ class Doctor extends Model
     public function getShiftTimeAttribute(): string
     {
         try {
-            $scheds = $this->relationLoaded('schedules') ? $this->schedules : $this->schedules()->get();
+            $scheds = $this->getCachedSchedules();
             $active = $scheds->where('status', true);
             if ($active->isNotEmpty()) {
                 $shiftsByDay = [];
@@ -232,7 +240,7 @@ class Doctor extends Model
     public function getTimeSlotsAttribute(): array
     {
         try {
-            $scheds = $this->relationLoaded('schedules') ? $this->schedules : $this->schedules()->get();
+            $scheds = $this->getCachedSchedules();
             $activeSchedules = $scheds->where('status', true);
             if ($activeSchedules->isNotEmpty()) {
                 $slots = [];
@@ -317,60 +325,164 @@ class Doctor extends Model
         return $this->hasMany(Booking::class);
     }
 
+    protected static ?array $batchBookingsByDoctor = null;
+
+    /**
+     * Batch preload active booking counts for the next 60 days in a single fast query.
+     */
+    public static function preloadActiveBookings(?array $doctorIds = null): void
+    {
+        $today = Carbon::today();
+        $maxDate = (clone $today)->addDays(60);
+
+        $query = Booking::whereBetween('appointment_date', [$today->format('Y-m-d'), $maxDate->format('Y-m-d')])
+            ->where('is_active', true)
+            ->whereNotIn('status', ['Cancelled', 'Rejected', 'Deleted']);
+
+        if (!empty($doctorIds)) {
+            $query->whereIn('doctor_id', $doctorIds);
+        }
+
+        $rows = $query->selectRaw('doctor_id, DATE(appointment_date) as app_date, count(*) as count')
+            ->groupBy('doctor_id', 'app_date')
+            ->get();
+
+        static::$batchBookingsByDoctor = [];
+        foreach ($rows as $r) {
+            static::$batchBookingsByDoctor[$r->doctor_id][$r->app_date] = (int) $r->count;
+        }
+    }
+
+    /**
+     * Helper to get active booking counts by date for a doctor (uses in-memory batch if preloaded).
+     */
+    public static function getBookingsByDateForDoctor(int $doctorId): array
+    {
+        if (static::$batchBookingsByDoctor !== null) {
+            return static::$batchBookingsByDoctor[$doctorId] ?? [];
+        }
+
+        $today = Carbon::today();
+        $maxDate = (clone $today)->addDays(60);
+
+        return Booking::where('doctor_id', $doctorId)
+            ->whereBetween('appointment_date', [$today->format('Y-m-d'), $maxDate->format('Y-m-d')])
+            ->where('is_active', true)
+            ->whereNotIn('status', ['Cancelled', 'Rejected', 'Deleted'])
+            ->selectRaw('DATE(appointment_date) as app_date, count(*) as count')
+            ->groupBy('app_date')
+            ->pluck('count', 'app_date')
+            ->toArray();
+    }
+
+    protected static ?array $candidateDates = null;
+    protected ?array $computedAvailability = null;
+
+    /**
+     * Precompute and memoize the 60-day calendar dates once per request.
+     */
+    public static function getCandidateDates(): array
+    {
+        if (static::$candidateDates !== null) {
+            return static::$candidateDates;
+        }
+
+        $today = Carbon::today();
+        $dates = [];
+        for ($i = 0; $i <= 60; $i++) {
+            $c = (clone $today)->addDays($i);
+            $dates[] = [
+                'index' => $i,
+                'carbon' => $c,
+                'dayShort' => $c->format('D'),
+                'dateStr' => $c->format('Y-m-d'),
+                'formatted' => $c->format('D, j M Y'),
+                'isToday' => ($i === 0),
+            ];
+        }
+
+        return static::$candidateDates = $dates;
+    }
+
+    /**
+     * Compute next schedule, fully booked dates, and closed dates in ONE single fast pass.
+     */
+    protected function computeScheduleAvailability(): array
+    {
+        if ($this->computedAvailability !== null) {
+            return $this->computedAvailability;
+        }
+
+        $scheds = $this->getCachedSchedules();
+        $activeScheds = $scheds->where('status', true);
+        if ($activeScheds->isEmpty()) {
+            return $this->computedAvailability = [
+                'next_schedule' => null,
+                'fully_booked_dates' => [],
+                'closed_dates' => [],
+            ];
+        }
+
+        $dates = static::getCandidateDates();
+        $bookingsByDate = static::getBookingsByDateForDoctor($this->id);
+
+        $nextSchedule = null;
+        $fullyBookedDates = [];
+        $closedDates = [];
+
+        foreach ($dates as $d) {
+            $candidate = $d['carbon'];
+            $dayShort = $d['dayShort'];
+            $dateStr = $d['dateStr'];
+            $isToday = $d['isToday'];
+
+            foreach ($activeScheds as $sched) {
+                if (strcasecmp($sched->day_of_week, $dayShort) === 0 && $sched->isOnDutyOnDate($candidate)) {
+                    $isClosedToday = $isToday && $sched->isBookingClosedForDate($candidate);
+                    if ($isClosedToday) {
+                        $closedDates[] = $dateStr;
+                    }
+
+                    $cap = (int) ($sched->capacity ?: ($this->daily_capacity ?: 20));
+                    $booked = $bookingsByDate[$dateStr] ?? 0;
+                    $isFullyBooked = ($booked >= $cap);
+
+                    if ($isFullyBooked || $isClosedToday) {
+                        $fullyBookedDates[] = $dateStr;
+                    }
+
+                    if ($nextSchedule === null && !$isClosedToday) {
+                        $nextSchedule = [
+                            'date' => $dateStr,
+                            'formatted_date' => $d['formatted'],
+                            'day_of_week' => $dayShort,
+                            'capacity' => $cap,
+                            'booked_count' => $booked,
+                            'remaining_slots' => max(0, $cap - $booked),
+                            'is_fully_booked' => $isFullyBooked,
+                            'shift_time' => $sched->shift_time ?: $sched->formatted_shift ?: '08:00 AM – 02:00 PM',
+                        ];
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        return $this->computedAvailability = [
+            'next_schedule' => $nextSchedule,
+            'fully_booked_dates' => array_values(array_unique($fullyBookedDates)),
+            'closed_dates' => array_values(array_unique($closedDates)),
+        ];
+    }
+
     /**
      * Get the next upcoming scheduled clinic date for this doctor on or after today,
      * along with real-time active bookings count, capacity, and fully booked status.
      */
     public function getNextScheduleAttribute(): ?array
     {
-        try {
-            $scheds = $this->relationLoaded('schedules') ? $this->schedules : $this->schedules()->get();
-            $activeScheds = $scheds->where('status', true);
-            if ($activeScheds->isEmpty()) {
-                return null;
-            }
-
-            $today = Carbon::today();
-            // Look ahead up to 60 days to find earliest duty date on or after today
-            for ($i = 0; $i <= 60; $i++) {
-                $candidate = (clone $today)->addDays($i);
-                $dayShort = $candidate->format('D');
-
-                foreach ($activeScheds as $sched) {
-                    if (strcasecmp($sched->day_of_week, $dayShort) === 0 && $sched->isOnDutyOnDate($candidate)) {
-                        // If candidate is today and booking is closed (within 10 minutes to start or past), skip to next clinic day
-                        if ($i === 0 && $sched->isBookingClosedForDate($candidate)) {
-                            continue;
-                        }
-
-                        $cap = (int) ($sched->capacity ?: ($this->daily_capacity ?: 20));
-                        $dateStr = $candidate->format('Y-m-d');
-
-                        $bookedCount = Booking::where('doctor_id', $this->id)
-                            ->whereDate('appointment_date', $dateStr)
-                            ->where('is_active', true)
-                            ->whereNotIn('status', ['Cancelled', 'Rejected', 'Deleted'])
-                            ->count();
-
-                        $remaining = max(0, $cap - $bookedCount);
-                        $isFullyBooked = ($bookedCount >= $cap);
-
-                        return [
-                            'date' => $dateStr,
-                            'formatted_date' => $candidate->format('D, j M Y'),
-                            'day_of_week' => $dayShort,
-                            'capacity' => $cap,
-                            'booked_count' => $bookedCount,
-                            'remaining_slots' => $remaining,
-                            'is_fully_booked' => $isFullyBooked,
-                            'shift_time' => $sched->shift_time ?: $sched->formatted_shift ?: '08:00 AM – 02:00 PM',
-                        ];
-                    }
-                }
-            }
-        } catch (\Throwable $e) {}
-
-        return null;
+        return $this->computeScheduleAvailability()['next_schedule'];
     }
 
     /**
@@ -378,49 +490,7 @@ class Doctor extends Model
      */
     public function getFullyBookedDatesAttribute(): array
     {
-        try {
-            $scheds = $this->relationLoaded('schedules') ? $this->schedules : $this->schedules()->get();
-            $activeScheds = $scheds->where('status', true);
-            if ($activeScheds->isEmpty()) {
-                return [];
-            }
-
-            $today = Carbon::today();
-            $maxDate = (clone $today)->addDays(60);
-
-            $bookingsByDate = Booking::where('doctor_id', $this->id)
-                ->whereBetween('appointment_date', [$today->format('Y-m-d'), $maxDate->format('Y-m-d')])
-                ->where('is_active', true)
-                ->whereNotIn('status', ['Cancelled', 'Rejected', 'Deleted'])
-                ->selectRaw('DATE(appointment_date) as app_date, count(*) as count')
-                ->groupBy('app_date')
-                ->pluck('count', 'app_date')
-                ->toArray();
-
-            $fullDates = [];
-            for ($i = 0; $i <= 60; $i++) {
-                $candidate = (clone $today)->addDays($i);
-                $dayShort = $candidate->format('D');
-                $dateStr = $candidate->format('Y-m-d');
-
-                foreach ($activeScheds as $sched) {
-                    if (strcasecmp($sched->day_of_week, $dayShort) === 0 && $sched->isOnDutyOnDate($candidate)) {
-                        $cap = (int) ($sched->capacity ?: ($this->daily_capacity ?: 20));
-                        $booked = $bookingsByDate[$dateStr] ?? 0;
-                        $isClosedToday = ($i === 0 && $sched->isBookingClosedForDate($candidate));
-
-                        if ($booked >= $cap || $isClosedToday) {
-                            $fullDates[] = $dateStr;
-                        }
-                        break;
-                    }
-                }
-            }
-
-            return array_values(array_unique($fullDates));
-        } catch (\Throwable $e) {
-            return [];
-        }
+        return $this->computeScheduleAvailability()['fully_booked_dates'];
     }
 
     /**
@@ -428,30 +498,7 @@ class Doctor extends Model
      */
     public function getClosedDatesAttribute(): array
     {
-        try {
-            $scheds = $this->relationLoaded('schedules') ? $this->schedules : $this->schedules()->get();
-            $activeScheds = $scheds->where('status', true);
-            if ($activeScheds->isEmpty()) {
-                return [];
-            }
-
-            $today = Carbon::today();
-            $dayShort = $today->format('D');
-            $closed = [];
-
-            foreach ($activeScheds as $sched) {
-                if (strcasecmp($sched->day_of_week, $dayShort) === 0 && $sched->isOnDutyOnDate($today)) {
-                    if ($sched->isBookingClosedForDate($today)) {
-                        $closed[] = $today->format('Y-m-d');
-                    }
-                    break;
-                }
-            }
-
-            return array_values(array_unique($closed));
-        } catch (\Throwable $e) {
-            return [];
-        }
+        return $this->computeScheduleAvailability()['closed_dates'];
     }
 
     /**

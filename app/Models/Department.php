@@ -49,11 +49,15 @@ class Department extends Model
 
     public function getClinicSchedulesAttribute(): array
     {
-        $doctors = $this->relationLoaded('doctors') ? $this->doctors : $this->doctors()->with('schedules')->get();
+        if (!$this->relationLoaded('doctors')) {
+            return [];
+        }
+
+        $doctors = $this->doctors;
         $dayMap = [];
 
         foreach ($doctors as $doc) {
-            $schedules = $doc->relationLoaded('schedules') ? $doc->schedules : $doc->schedules()->get();
+            $schedules = $doc->relationLoaded('schedules') ? $doc->schedules : [];
             foreach ($schedules as $s) {
                 $day = $s->day_of_week;
                 if (!$day) continue;
@@ -103,9 +107,10 @@ class Department extends Model
 
     public function getOperatingDaysAttribute(): array
     {
+        $scheds = $this->clinic_schedules;
         return array_map(function ($s) {
             return $s['day'];
-        }, $this->clinic_schedules);
+        }, $scheds);
     }
 
     public function getOperatingHoursAttribute(): string

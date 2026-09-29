@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Department;
+use App\Models\Doctor;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
@@ -12,6 +13,7 @@ class DepartmentController extends Controller
 {
     public function index(Request $request): JsonResponse
     {
+        Doctor::preloadActiveBookings();
         $departments = Department::with(['doctors.schedules'])->withCount('doctors')->orderBy('name')->get();
         if (!$request->user('sanctum')) {
             $departments->each(function ($dept) {

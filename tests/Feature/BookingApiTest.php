@@ -122,9 +122,10 @@ class BookingApiTest extends TestCase
         $dayOfWeek = $futureDate->format('D');
 
         \App\Models\DoctorSchedule::updateOrCreate(
-            ['doctor_id' => $doctor->id, 'day_of_week' => $dayOfWeek],
+            ['code' => 'SCHED-DUP-' . $doctor->id],
             [
-                'code' => 'SCHED-DUP-' . $doctor->id,
+                'doctor_id' => $doctor->id,
+                'day_of_week' => $dayOfWeek,
                 'recurrence_type' => 'every',
                 'start_time' => '08:00:00',
                 'end_time' => '17:00:00',
@@ -190,9 +191,10 @@ class BookingApiTest extends TestCase
         $doctor2 = \App\Models\Doctor::where('department_id', '!=', $doctor->department_id)->first();
         if ($doctor2) {
             \App\Models\DoctorSchedule::updateOrCreate(
-                ['doctor_id' => $doctor2->id, 'day_of_week' => $dayOfWeek],
+                ['code' => 'SCHED-DUP2-' . $doctor2->id],
                 [
-                    'code' => 'SCHED-DUP2-' . $doctor2->id,
+                    'doctor_id' => $doctor2->id,
+                    'day_of_week' => $dayOfWeek,
                     'recurrence_type' => 'every',
                     'start_time' => '08:00:00',
                     'end_time' => '17:00:00',

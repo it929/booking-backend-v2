@@ -93,6 +93,7 @@ class BookingController extends Controller
             });
         }
 
+        Doctor::preloadActiveBookings();
         $bookings = $query->orderBy('created_at', 'desc')->get();
         return response()->json($bookings);
     }

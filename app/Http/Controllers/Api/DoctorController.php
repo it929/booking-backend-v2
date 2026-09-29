@@ -37,6 +37,8 @@ class DoctorController extends Controller
             });
         }
 
+        Doctor::preloadActiveBookings();
+
         $doctors = $query->orderBy('departments.name', 'asc')
             ->orderBy('doctors.name', 'asc')
             ->get();
